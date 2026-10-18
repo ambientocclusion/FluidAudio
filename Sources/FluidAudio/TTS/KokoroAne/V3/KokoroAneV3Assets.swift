@@ -137,6 +137,11 @@ enum KokoroAneV3Assets {
             throw KokoroAneError.downloadFailed("Invalid pinned v3 manifest checksum")
         }
         let manifest = try JSONDecoder().decode(Manifest.self, from: data)
+        // Files verified on an earlier load are trusted while their size and modification date are
+        // unchanged, so a warm load does not re-hash hundreds of megabytes.
+        let verifiedURL = root.appendingPathComponent(VerifiedFiles.fileName)
+        var verified = VerifiedFiles.load(from: verifiedURL, manifestHash: expectedHash)
+        defer { verified.save(to: verifiedURL) }
         guard manifest.language == language(variant), manifest.base.repoId == repository,
             manifest.base.revision == baseRevision,
             manifest.base.directory == (variant == .mandarin ? "ANE-zh" : "ANE"),
@@ -146,7 +151,9 @@ enum KokoroAneV3Assets {
         for file in files {
             try Task.checkCancellation()
             let target = root.appendingPathComponent(file.path)
+            if verified.isUnchanged(file.path, at: target) { continue }
             if let cached = try? Data(contentsOf: target, options: .mappedIfSafe), matches(cached, file: file) {
+                verified.record(file.path, at: target)
                 continue
             }
             let bytes = try await fetch("\(prefix(variant))/\(file.path)", revision: revision)
@@ -156,13 +163,17 @@ enum KokoroAneV3Assets {
             try FileManager.default.createDirectory(
                 at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
             try bytes.write(to: target, options: .atomic)
+            verified.record(file.path, at: target)
         }
         let baseFiles = try await baseIndex(manifest: manifest, root: root)
         for file in baseFiles {
             try Task.checkCancellation()
             let relative = String(file.path.dropFirst(manifest.base.directory.count + 1))
-            let target = root.appendingPathComponent("base/\(relative)")
+            let key = "base/\(relative)"
+            let target = root.appendingPathComponent(key)
+            if verified.isUnchanged(key, at: target) { continue }
             if let cached = try? Data(contentsOf: target, options: .mappedIfSafe), matches(cached, treeFile: file) {
+                verified.record(key, at: target)
                 continue
             }
             let bytes = try await fetch(file.path, revision: baseRevision)
@@ -172,6 +183,7 @@ enum KokoroAneV3Assets {
             try FileManager.default.createDirectory(
                 at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
             try bytes.write(to: target, options: .atomic)
+            verified.record(key, at: target)
         }
         if variant == .english {
             let file = File(
@@ -334,5 +346,51 @@ enum KokoroAneV3Assets {
             at: local.deletingLastPathComponent(), withIntermediateDirectories: true)
         try data.write(to: local, options: .atomic)
         return local
+    }
+}
+
+extension KokoroAneV3Assets {
+    /// Record of asset files whose checksum matched, keyed by repo-relative path. An entry stays valid
+    /// while the file keeps the size and modification date it had when verified; any rewrite, a
+    /// different pinned manifest, or an unreadable record falls back to full checksum verification.
+    struct VerifiedFiles: Codable, Equatable {
+        static let fileName = "verified-v3.json"
+
+        struct Stamp: Codable, Equatable {
+            let size: Int
+            let modified: Double
+        }
+
+        var manifestHash: String
+        var files: [String: Stamp] = [:]
+
+        static func load(from url: URL, manifestHash: String) -> VerifiedFiles {
+            guard let data = try? Data(contentsOf: url),
+                let record = try? JSONDecoder().decode(VerifiedFiles.self, from: data),
+                record.manifestHash == manifestHash
+            else { return VerifiedFiles(manifestHash: manifestHash) }
+            return record
+        }
+
+        func save(to url: URL) {
+            guard let data = try? JSONEncoder().encode(self) else { return }
+            try? data.write(to: url, options: .atomic)
+        }
+
+        func isUnchanged(_ path: String, at url: URL) -> Bool {
+            guard let recorded = files[path], let current = Self.stamp(of: url) else { return false }
+            return recorded == current
+        }
+
+        mutating func record(_ path: String, at url: URL) {
+            files[path] = Self.stamp(of: url)
+        }
+
+        static func stamp(of url: URL) -> Stamp? {
+            guard let values = try? url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey]),
+                let size = values.fileSize, let modified = values.contentModificationDate
+            else { return nil }
+            return Stamp(size: size, modified: modified.timeIntervalSince1970)
+        }
     }
 }

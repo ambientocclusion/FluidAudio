@@ -14,37 +14,31 @@ final class KokoroAneV3Pipeline {
         let stageMilliseconds: [String: Double]
         let usedFastVocoder: Bool
     }
-    private let models: [String: MLModel]
+    private var models: [String: MLModel]
+    /// Fallback-path models (dynamic Albert, Noise, Vocoder), loaded on first use: requests that fit
+    /// the static buckets never touch them, so loading them up front only costs time and memory.
+    private var deferredModels: [String: () throws -> MLModel]
     private let albertBuckets: [Int]
     private let decoderBuckets: [Int]
     private let source: KokoroAneV3NativeSource
     private let lock = NSLock()
     private typealias Arrays = KokoroAneV3Arrays
 
-    init(
-        baseDirectory: URL, fastDirectory: URL, decoderDirectory: URL,
-        progress: KokoroAneLoadProgressHandler? = nil
-    ) throws {
-        source = try KokoroAneV3NativeSource(parametersURL: fastDirectory.appendingPathComponent("native-source.json"))
-        var opened = 0
-        var modelCount = 0
-        func open(
-            _ directory: URL, _ name: String, _ units: MLComputeUnits, lowPrecision: Bool = false
-        ) throws -> MLModel {
-            let compiled = directory.appendingPathComponent(name + ".mlmodelc")
-            let package = directory.appendingPathComponent(name + ".mlpackage")
-            let configuration = MLModelConfiguration()
-            configuration.computeUnits = units
-            configuration.allowLowPrecisionAccumulationOnGPU = lowPrecision
-            opened += 1
-            if FileManager.default.fileExists(atPath: compiled.path) {
-                progress?(.loadingModel(name: name, index: opened, count: modelCount))
-                return try MLModel(contentsOf: compiled, configuration: configuration)
-            }
+    /// Opens a compiled model, compiling its source package on device first if needed.
+    private static func openModel(
+        _ directory: URL, _ name: String, _ units: MLComputeUnits, lowPrecision: Bool,
+        onCompile: () -> Void = {}, onLoad: () -> Void = {}
+    ) throws -> MLModel {
+        let compiled = directory.appendingPathComponent(name + ".mlmodelc")
+        let package = directory.appendingPathComponent(name + ".mlpackage")
+        let configuration = MLModelConfiguration()
+        configuration.computeUnits = units
+        configuration.allowLowPrecisionAccumulationOnGPU = lowPrecision
+        if !FileManager.default.fileExists(atPath: compiled.path) {
             guard FileManager.default.fileExists(atPath: package.path) else {
                 throw KokoroAneV3Error.missingModel(name)
             }
-            progress?(.compilingModel(name: name, index: opened, count: modelCount))
+            onCompile()
             let temporary = try MLModel.compileModel(at: package)
             defer { try? FileManager.default.removeItem(at: temporary) }
             let staging = compiled.appendingPathExtension(UUID().uuidString)
@@ -55,9 +49,16 @@ final class KokoroAneV3Pipeline {
             } catch {
                 guard FileManager.default.fileExists(atPath: compiled.path) else { throw error }
             }
-            progress?(.loadingModel(name: name, index: opened, count: modelCount))
-            return try MLModel(contentsOf: compiled, configuration: configuration)
         }
+        onLoad()
+        return try MLModel(contentsOf: compiled, configuration: configuration)
+    }
+
+    init(
+        baseDirectory: URL, fastDirectory: URL, decoderDirectory: URL,
+        progress: KokoroAneLoadProgressHandler? = nil
+    ) throws {
+        source = try KokoroAneV3NativeSource(parametersURL: fastDirectory.appendingPathComponent("native-source.json"))
         func buckets(_ directory: URL, _ prefix: String) throws -> [Int] {
             let names = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
             return Array(
@@ -75,22 +76,46 @@ final class KokoroAneV3Pipeline {
         guard !albertBuckets.isEmpty, !decoderBuckets.isEmpty else {
             throw KokoroAneV3Error.missingModel("Static buckets")
         }
-        let baseStages = ["Albert", "PostAlbert", "Alignment", "Prosody", "Noise", "Vocoder", "Tail"]
-        modelCount = baseStages.count + albertBuckets.count + decoderBuckets.count + 1
-        var loaded: [String: MLModel] = [:]
-        for stage in ["Albert", "PostAlbert", "Alignment", "Prosody", "Noise", "Vocoder", "Tail"] {
+
+        typealias Spec = (key: String, directory: URL, name: String, units: MLComputeUnits, lowPrecision: Bool)
+        func base(_ stage: String) -> Spec {
             let suffix = ["Noise", "Prosody", "Tail"].contains(stage) ? "_v2" : ""
             let units: MLComputeUnits = ["Noise", "Tail"].contains(stage) ? .cpuAndGPU : .cpuAndNeuralEngine
-            loaded[stage] = try open(baseDirectory, "Kokoro" + stage + suffix, units, lowPrecision: true)
+            return (stage, baseDirectory, "Kokoro" + stage + suffix, units, true)
         }
-        for bucket in albertBuckets {
-            loaded["Albert_\(bucket)"] = try open(fastDirectory, "KokoroAlbert_\(bucket)", .cpuAndNeuralEngine)
+        let eager: [Spec] =
+            ["PostAlbert", "Alignment", "Prosody", "Tail"].map(base)
+            + albertBuckets.map { bucket -> Spec in
+                ("Albert_\(bucket)", fastDirectory, "KokoroAlbert_\(bucket)", .cpuAndNeuralEngine, false)
+            }
+            + decoderBuckets.map { bucket -> Spec in
+                ("Decoder_\(bucket)", decoderDirectory, "KokoroDecoderPre_\(bucket)", .cpuAndNeuralEngine, false)
+            }
+            + [("SourceGenerator", fastDirectory, "KokoroSourceGenerator", .cpuAndGPU, false) as Spec]
+        let deferred: [Spec] = ["Albert", "Noise", "Vocoder"].map(base)
+
+        var loaded: [String: MLModel] = [:]
+        for (index, spec) in eager.enumerated() {
+            loaded[spec.key] = try Self.openModel(
+                spec.directory, spec.name, spec.units, lowPrecision: spec.lowPrecision,
+                onCompile: { progress?(.compilingModel(name: spec.name, index: index + 1, count: eager.count)) },
+                onLoad: { progress?(.loadingModel(name: spec.name, index: index + 1, count: eager.count)) })
         }
-        for bucket in decoderBuckets {
-            loaded["Decoder_\(bucket)"] = try open(decoderDirectory, "KokoroDecoderPre_\(bucket)", .cpuAndNeuralEngine)
-        }
-        loaded["SourceGenerator"] = try open(fastDirectory, "KokoroSourceGenerator", .cpuAndGPU)
         models = loaded
+        deferredModels = Dictionary(
+            uniqueKeysWithValues: deferred.map { spec in
+                (spec.key, { try Self.openModel(spec.directory, spec.name, spec.units, lowPrecision: spec.lowPrecision) })
+            })
+    }
+
+    /// A loaded model, opening a deferred one on first use. Called with `lock` held.
+    private func model(_ key: String) throws -> MLModel {
+        if let model = models[key] { return model }
+        guard let open = deferredModels[key] else { throw KokoroAneV3Error.missingModel(key) }
+        let model = try open()
+        models[key] = model
+        deferredModels[key] = nil
+        return model
     }
 
     func synthesize(inputIds: [Int32], style: [Float], speed: Float = 1) throws -> Result {
@@ -110,7 +135,7 @@ final class KokoroAneV3Pipeline {
         var timings: [String: Double] = [:]
         func time() -> Double { Double(DispatchTime.now().uptimeNanoseconds) / 1e6 }
         func predict(_ stage: String, _ input: [String: MLMultiArray]) throws -> MLFeatureProvider {
-            guard let model = models[stage] else { throw KokoroAneV3Error.missingModel(stage) }
+            let model = try self.model(stage)
             let start = time()
             var prepared = input
             for (name, value) in input {

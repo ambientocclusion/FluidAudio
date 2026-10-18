@@ -26,8 +26,11 @@ final class KokoroAneV3Pipeline {
 
     init(
         baseDirectory: URL, fastDirectory: URL, decoderDirectory: URL,
-        computeUnits: KokoroAneComputeUnits
+        computeUnits: KokoroAneComputeUnits, progress: KokoroAneLoadProgressHandler? = nil
     ) throws {
+        // Position and total of the models opened so far, for load progress.
+        var opened = 0
+        var modelCount = 0
         func open(
             _ directory: URL, _ name: String, _ units: MLComputeUnits, lowPrecision: Bool = false
         ) throws -> MLModel {
@@ -36,10 +39,12 @@ final class KokoroAneV3Pipeline {
             let configuration = MLModelConfiguration()
             configuration.computeUnits = units
             configuration.allowLowPrecisionAccumulationOnGPU = lowPrecision
+            opened += 1
             // Same "compiled" test KokoroAneV3Assets.ensure uses to skip the
             // source package (#1043), so the two never disagree about a bundle.
             if KokoroAneV3Assets.isCompiledBundle(at: compiled) {
                 do {
+                    progress?(.loadingModel(name: name, index: opened, count: modelCount))
                     return try MLModel(contentsOf: compiled, configuration: configuration)
                 } catch {
                     // Corrupt or no-longer-loadable compiled bundle. Drop it so
@@ -55,6 +60,7 @@ final class KokoroAneV3Pipeline {
             guard FileManager.default.fileExists(atPath: package.path) else {
                 throw KokoroAneV3Error.missingModel(name)
             }
+            progress?(.compilingModel(name: name, index: opened, count: modelCount))
             let temporary = try MLModel.compileModel(at: package)
             defer { try? FileManager.default.removeItem(at: temporary) }
             let staging = compiled.appendingPathExtension(UUID().uuidString)
@@ -65,6 +71,7 @@ final class KokoroAneV3Pipeline {
             } catch {
                 guard FileManager.default.fileExists(atPath: compiled.path) else { throw error }
             }
+            progress?(.loadingModel(name: name, index: opened, count: modelCount))
             return try MLModel(contentsOf: compiled, configuration: configuration)
         }
         func buckets(_ directory: URL, _ prefix: String) throws -> [Int] {
@@ -81,6 +88,7 @@ final class KokoroAneV3Pipeline {
         }
         albertBuckets = try buckets(fastDirectory, "KokoroAlbert_")
         guard !albertBuckets.isEmpty else { throw KokoroAneV3Error.missingModel("Static buckets") }
+        modelCount = KokoroAneStage.allCases.count + albertBuckets.count
         var loaded: [String: MLModel] = [:]
         // Base stages follow the caller's routing, so the OS 27 default
         // (`aneTailCpu`) keeps Noise and Tail off Metal like the legacy chain (#1103).
@@ -98,6 +106,7 @@ final class KokoroAneV3Pipeline {
                 parametersURL: fastDirectory.appendingPathComponent("native-source.json"))
             decoderBuckets = try buckets(decoderDirectory, "KokoroDecoderPre_")
             guard !decoderBuckets.isEmpty else { throw KokoroAneV3Error.missingModel("Static buckets") }
+            modelCount += decoderBuckets.count + 1
             for bucket in decoderBuckets {
                 loaded["Decoder_\(bucket)"] = try open(
                     decoderDirectory, "KokoroDecoderPre_\(bucket)", .cpuAndNeuralEngine)

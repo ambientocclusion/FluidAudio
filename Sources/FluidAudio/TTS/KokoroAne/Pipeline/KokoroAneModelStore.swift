@@ -217,16 +217,18 @@ public actor KokoroAneModelStore {
     /// to `self.models` once every stage succeeds. This keeps `loadIfNeeded()`
     /// retryable: if any stage throws, `self.models` stays empty and the next
     /// call retries from scratch instead of returning early on a partial state.
-    public func loadIfNeeded() async throws {
+    /// - Parameter progress: Steps of the load (v3 only). A caller that joins a load already in
+    ///   flight receives no steps.
+    public func loadIfNeeded(progress: KokoroAneLoadProgressHandler? = nil) async throws {
         guard !isLoaded else { return }
         if let task = loadingTask { return try await task.value }
-        let task = Task { try await self.loadModels() }
+        let task = Task { try await self.loadModels(progress: progress) }
         loadingTask = task
         defer { loadingTask = nil }
         try await task.value
     }
 
-    private func loadModels() async throws {
+    private func loadModels(progress: KokoroAneLoadProgressHandler?) async throws {
         if version == .v3 {
             guard #available(macOS 15, iOS 18, tvOS 18, *) else {
                 throw KokoroAneError.inputProcessingFailed("ANE-v3 requires macOS 15 / iOS 18 or newer")
@@ -241,15 +243,16 @@ public actor KokoroAneModelStore {
             }
             let root = try await KokoroAneV3Assets.ensure(
                 variant: variant, directory: directory,
-                fastVocoder: KokoroAneV3Pipeline.usesFastVocoder(computeUnits))
+                fastVocoder: KokoroAneV3Pipeline.usesFastVocoder(computeUnits), progress: progress)
             let loadedVocab = try KokoroAneVocab.load(from: root.appendingPathComponent("vocab.json"))
+            progress?(.loadingVoice(variant.defaultVoice))
             let voiceURL = try await KokoroAneV3Assets.ensureVoice(variant.defaultVoice, variant: variant, root: root)
             let defaultPack = try KokoroAneVoicePack.load(from: voiceURL)
             let pipeline = try KokoroAneV3Pipeline(
                 baseDirectory: root.appendingPathComponent("base"),
                 fastDirectory: root.appendingPathComponent("fast"),
                 decoderDirectory: root.appendingPathComponent("decoder"),
-                computeUnits: computeUnits)
+                computeUnits: computeUnits, progress: progress)
             try Task.checkCancellation()
             v3Pipeline = pipeline
             vocab = loadedVocab

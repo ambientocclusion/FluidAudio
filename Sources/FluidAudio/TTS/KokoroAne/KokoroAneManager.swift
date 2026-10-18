@@ -85,18 +85,40 @@ public actor KokoroAneManager {
 
     /// Download (if missing), load the selected runtime + vocab + default voice
     /// pack. Optionally pre-warm additional voice packs.
-    public func initialize(preloadVoices: Set<String>? = nil) async throws {
+    ///
+    /// - Parameters:
+    ///   - prepareTextFrontend: Also load the Japanese / Mandarin text frontend now; otherwise it
+    ///     loads on the first synthesis, which then stalls. English always prepares it here.
+    ///   - progress: Steps of the load, for apps that show what a long initialization is doing.
+    public func initialize(
+        preloadVoices: Set<String>? = nil,
+        prepareTextFrontend: Bool = false,
+        progress: KokoroAneLoadProgressHandler? = nil
+    ) async throws {
         if let advisory = Self.osAdvisory(for: ProcessInfo.processInfo.operatingSystemVersion) {
             logger.warning(advisory)
         }
-        try await store.loadIfNeeded()
+        try await store.loadIfNeeded(progress: progress)
         // English G2P CoreML assets live in the kokoro repo under
         // `<models root>/kokoro/`. The Mandarin variant routes through the
         // in-process MandarinG2P pipeline (loaded by store.loadIfNeeded())
         // and never touches the BART G2P model, so the English G2P bundle
         // would just be wasted bandwidth + memory.
         if variant == .english {
+            progress?(.preparingTextFrontend)
             try await prepareEnglishFrontend()
+        }
+        if prepareTextFrontend {
+            switch variant {
+            case .japanese:
+                progress?(.preparingTextFrontend)
+                _ = try await store.japaneseG2PPipeline()
+            case .mandarin:
+                progress?(.preparingTextFrontend)
+                _ = try await store.mandarinG2PPipeline()
+            case .english, .spanish, .french:
+                break
+            }
         }
         switch variant {
         case .french:
@@ -111,6 +133,7 @@ public actor KokoroAneManager {
         }
         if let voices = preloadVoices {
             for voice in voices {
+                progress?(.loadingVoice(voice))
                 _ = try await store.voicePack(voice)
             }
         }

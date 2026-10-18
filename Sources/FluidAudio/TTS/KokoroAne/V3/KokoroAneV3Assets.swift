@@ -138,16 +138,20 @@ enum KokoroAneV3Assets {
     /// source package whose compiled bundle already exists are skipped.
     private static func ensureFile(
         _ relative: String, root: URL, verified: inout VerifiedFiles,
+        step: (index: Int, count: Int), progress: KokoroAneLoadProgressHandler?,
         fetch: () async throws -> Data, matches: (Data) -> Bool
     ) async throws {
         try Task.checkCancellation()
         if hasCompiledBundle(forSourceFile: relative, root: root) { return }
         let target = root.appendingPathComponent(relative)
         if verified.isUnchanged(relative, at: target) { return }
+        let name = target.lastPathComponent
+        progress?(.verifyingFile(name: name, index: step.index, count: step.count))
         if let cached = try? Data(contentsOf: target, options: .mappedIfSafe), matches(cached) {
             verified.record(relative, at: target)
             return
         }
+        progress?(.downloadingFile(name: name, index: step.index, count: step.count))
         let bytes = try await fetch()
         guard matches(bytes) else {
             throw KokoroAneError.downloadFailed("Checksum mismatch: \(relative)")
@@ -185,8 +189,12 @@ enum KokoroAneV3Assets {
         return fastVocoder ? selected : selected.filter { !isFastVocoderFile($0.path) }
     }
 
-    static func ensure(variant: KokoroAneVariant, directory: URL?, fastVocoder: Bool) async throws -> URL {
+    static func ensure(
+        variant: KokoroAneVariant, directory: URL?, fastVocoder: Bool,
+        progress: KokoroAneLoadProgressHandler? = nil
+    ) async throws -> URL {
         try validateVariant(variant)
+        progress?(.checkingManifest)
         let root = try cacheDirectory(variant: variant, directory: directory)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         let manifestURL = root.appendingPathComponent("manifest.json")
@@ -215,16 +223,18 @@ enum KokoroAneV3Assets {
             manifest.base.directory == (variant == .mandarin ? "ANE-zh" : "ANE"),
             Set(manifest.base.models) == originalBaseModels
         else { throw KokoroAneError.downloadFailed("Unexpected v3 checkpoint dependencies") }
-        for file in try selectedFiles(manifest, fastVocoder: fastVocoder) {
+        let files = try selectedFiles(manifest, fastVocoder: fastVocoder)
+        for (index, file) in files.enumerated() {
             try await ensureFile(
-                file.path, root: root, verified: &verified,
+                file.path, root: root, verified: &verified, step: (index + 1, files.count), progress: progress,
                 fetch: { try await fetch("\(prefix(variant))/\(file.path)", revision: revision) },
                 matches: { matches($0, file: file) })
         }
-        for file in try await baseIndex(manifest: manifest, root: root) {
+        let baseFiles = try await baseIndex(manifest: manifest, root: root)
+        for (index, file) in baseFiles.enumerated() {
             try await ensureFile(
                 "base/" + String(file.path.dropFirst(manifest.base.directory.count + 1)), root: root,
-                verified: &verified,
+                verified: &verified, step: (index + 1, baseFiles.count), progress: progress,
                 fetch: { try await fetch(file.path, revision: baseRevision) },
                 matches: { matches($0, treeFile: file) })
         }

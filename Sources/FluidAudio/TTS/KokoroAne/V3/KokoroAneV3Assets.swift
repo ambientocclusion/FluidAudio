@@ -137,13 +137,15 @@ enum KokoroAneV3Assets {
     /// copy, otherwise fetch, verify and write it atomically. Files inside a
     /// source package whose compiled bundle already exists are skipped.
     private static func ensureFile(
-        _ relative: String, root: URL,
+        _ relative: String, root: URL, verified: inout VerifiedFiles,
         fetch: () async throws -> Data, matches: (Data) -> Bool
     ) async throws {
         try Task.checkCancellation()
         if hasCompiledBundle(forSourceFile: relative, root: root) { return }
         let target = root.appendingPathComponent(relative)
+        if verified.isUnchanged(relative, at: target) { return }
         if let cached = try? Data(contentsOf: target, options: .mappedIfSafe), matches(cached) {
+            verified.record(relative, at: target)
             return
         }
         let bytes = try await fetch()
@@ -153,6 +155,7 @@ enum KokoroAneV3Assets {
         try FileManager.default.createDirectory(
             at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
         try bytes.write(to: target, options: .atomic)
+        verified.record(relative, at: target)
     }
 
     /// Assets only the fast vocoder uses: the masked decoder buckets, the
@@ -202,6 +205,11 @@ enum KokoroAneV3Assets {
             throw KokoroAneError.downloadFailed("Invalid pinned v3 manifest checksum")
         }
         let manifest = try JSONDecoder().decode(Manifest.self, from: data)
+        // Files verified on an earlier load are trusted while their size and modification date are
+        // unchanged, so a warm load does not re-hash hundreds of megabytes.
+        let verifiedURL = root.appendingPathComponent(VerifiedFiles.fileName)
+        var verified = VerifiedFiles.load(from: verifiedURL, manifestHash: expectedHash)
+        defer { verified.save(to: verifiedURL) }
         guard manifest.language == language(variant), manifest.base.repoId == repository,
             manifest.base.revision == baseRevision,
             manifest.base.directory == (variant == .mandarin ? "ANE-zh" : "ANE"),
@@ -209,13 +217,14 @@ enum KokoroAneV3Assets {
         else { throw KokoroAneError.downloadFailed("Unexpected v3 checkpoint dependencies") }
         for file in try selectedFiles(manifest, fastVocoder: fastVocoder) {
             try await ensureFile(
-                file.path, root: root,
+                file.path, root: root, verified: &verified,
                 fetch: { try await fetch("\(prefix(variant))/\(file.path)", revision: revision) },
                 matches: { matches($0, file: file) })
         }
         for file in try await baseIndex(manifest: manifest, root: root) {
             try await ensureFile(
                 "base/" + String(file.path.dropFirst(manifest.base.directory.count + 1)), root: root,
+                verified: &verified,
                 fetch: { try await fetch(file.path, revision: baseRevision) },
                 matches: { matches($0, treeFile: file) })
         }
@@ -380,6 +389,52 @@ enum KokoroAneV3Assets {
             at: local.deletingLastPathComponent(), withIntermediateDirectories: true)
         try data.write(to: local, options: .atomic)
         return local
+    }
+}
+
+extension KokoroAneV3Assets {
+    /// Record of asset files whose checksum matched, keyed by repo-relative path. An entry stays valid
+    /// while the file keeps the size and modification date it had when verified; any rewrite, a
+    /// different pinned manifest, or an unreadable record falls back to full checksum verification.
+    struct VerifiedFiles: Codable, Equatable {
+        static let fileName = "verified-v3.json"
+
+        struct Stamp: Codable, Equatable {
+            let size: Int
+            let modified: Double
+        }
+
+        var manifestHash: String
+        var files: [String: Stamp] = [:]
+
+        static func load(from url: URL, manifestHash: String) -> VerifiedFiles {
+            guard let data = try? Data(contentsOf: url),
+                let record = try? JSONDecoder().decode(VerifiedFiles.self, from: data),
+                record.manifestHash == manifestHash
+            else { return VerifiedFiles(manifestHash: manifestHash) }
+            return record
+        }
+
+        func save(to url: URL) {
+            guard let data = try? JSONEncoder().encode(self) else { return }
+            try? data.write(to: url, options: .atomic)
+        }
+
+        func isUnchanged(_ path: String, at url: URL) -> Bool {
+            guard let recorded = files[path], let current = Self.stamp(of: url) else { return false }
+            return recorded == current
+        }
+
+        mutating func record(_ path: String, at url: URL) {
+            files[path] = Self.stamp(of: url)
+        }
+
+        static func stamp(of url: URL) -> Stamp? {
+            guard let values = try? url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey]),
+                let size = values.fileSize, let modified = values.contentModificationDate
+            else { return nil }
+            return Stamp(size: size, modified: modified.timeIntervalSince1970)
+        }
     }
 }
 #endif

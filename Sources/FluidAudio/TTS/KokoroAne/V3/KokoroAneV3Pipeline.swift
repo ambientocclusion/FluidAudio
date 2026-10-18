@@ -21,8 +21,13 @@ final class KokoroAneV3Pipeline {
     private let lock = NSLock()
     private typealias Arrays = KokoroAneV3Arrays
 
-    init(baseDirectory: URL, fastDirectory: URL, decoderDirectory: URL) throws {
+    init(
+        baseDirectory: URL, fastDirectory: URL, decoderDirectory: URL,
+        progress: KokoroAneLoadProgressHandler? = nil
+    ) throws {
         source = try KokoroAneV3NativeSource(parametersURL: fastDirectory.appendingPathComponent("native-source.json"))
+        var opened = 0
+        var modelCount = 0
         func open(
             _ directory: URL, _ name: String, _ units: MLComputeUnits, lowPrecision: Bool = false
         ) throws -> MLModel {
@@ -31,12 +36,15 @@ final class KokoroAneV3Pipeline {
             let configuration = MLModelConfiguration()
             configuration.computeUnits = units
             configuration.allowLowPrecisionAccumulationOnGPU = lowPrecision
+            opened += 1
             if FileManager.default.fileExists(atPath: compiled.path) {
+                progress?(.loadingModel(name: name, index: opened, count: modelCount))
                 return try MLModel(contentsOf: compiled, configuration: configuration)
             }
             guard FileManager.default.fileExists(atPath: package.path) else {
                 throw KokoroAneV3Error.missingModel(name)
             }
+            progress?(.compilingModel(name: name, index: opened, count: modelCount))
             let temporary = try MLModel.compileModel(at: package)
             defer { try? FileManager.default.removeItem(at: temporary) }
             let staging = compiled.appendingPathExtension(UUID().uuidString)
@@ -47,6 +55,7 @@ final class KokoroAneV3Pipeline {
             } catch {
                 guard FileManager.default.fileExists(atPath: compiled.path) else { throw error }
             }
+            progress?(.loadingModel(name: name, index: opened, count: modelCount))
             return try MLModel(contentsOf: compiled, configuration: configuration)
         }
         func buckets(_ directory: URL, _ prefix: String) throws -> [Int] {
@@ -66,6 +75,8 @@ final class KokoroAneV3Pipeline {
         guard !albertBuckets.isEmpty, !decoderBuckets.isEmpty else {
             throw KokoroAneV3Error.missingModel("Static buckets")
         }
+        let baseStages = ["Albert", "PostAlbert", "Alignment", "Prosody", "Noise", "Vocoder", "Tail"]
+        modelCount = baseStages.count + albertBuckets.count + decoderBuckets.count + 1
         var loaded: [String: MLModel] = [:]
         for stage in ["Albert", "PostAlbert", "Alignment", "Prosody", "Noise", "Vocoder", "Tail"] {
             let suffix = ["Noise", "Prosody", "Tail"].contains(stage) ? "_v2" : ""

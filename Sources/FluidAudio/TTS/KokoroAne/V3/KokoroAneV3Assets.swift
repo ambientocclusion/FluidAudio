@@ -117,8 +117,11 @@ enum KokoroAneV3Assets {
         return selected
     }
 
-    static func ensure(variant: KokoroAneVariant, directory: URL?) async throws -> URL {
+    static func ensure(
+        variant: KokoroAneVariant, directory: URL?, progress: KokoroAneLoadProgressHandler? = nil
+    ) async throws -> URL {
         try validateVariant(variant)
+        progress?(.checkingManifest)
         let root = try cacheDirectory(variant: variant, directory: directory)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         let manifestURL = root.appendingPathComponent("manifest.json")
@@ -148,14 +151,17 @@ enum KokoroAneV3Assets {
             Set(manifest.base.models) == originalBaseModels
         else { throw KokoroAneError.downloadFailed("Unexpected v3 checkpoint dependencies") }
         let files = try selectedFiles(manifest)
-        for file in files {
+        for (index, file) in files.enumerated() {
             try Task.checkCancellation()
             let target = root.appendingPathComponent(file.path)
             if verified.isUnchanged(file.path, at: target) { continue }
+            let name = target.lastPathComponent
+            progress?(.verifyingFile(name: name, index: index + 1, count: files.count))
             if let cached = try? Data(contentsOf: target, options: .mappedIfSafe), matches(cached, file: file) {
                 verified.record(file.path, at: target)
                 continue
             }
+            progress?(.downloadingFile(name: name, index: index + 1, count: files.count))
             let bytes = try await fetch("\(prefix(variant))/\(file.path)", revision: revision)
             guard matches(bytes, file: file) else {
                 throw KokoroAneError.downloadFailed("Checksum mismatch: \(file.path)")
@@ -166,16 +172,19 @@ enum KokoroAneV3Assets {
             verified.record(file.path, at: target)
         }
         let baseFiles = try await baseIndex(manifest: manifest, root: root)
-        for file in baseFiles {
+        for (index, file) in baseFiles.enumerated() {
             try Task.checkCancellation()
             let relative = String(file.path.dropFirst(manifest.base.directory.count + 1))
             let key = "base/\(relative)"
             let target = root.appendingPathComponent(key)
             if verified.isUnchanged(key, at: target) { continue }
+            let name = target.lastPathComponent
+            progress?(.verifyingFile(name: name, index: index + 1, count: baseFiles.count))
             if let cached = try? Data(contentsOf: target, options: .mappedIfSafe), matches(cached, treeFile: file) {
                 verified.record(key, at: target)
                 continue
             }
+            progress?(.downloadingFile(name: name, index: index + 1, count: baseFiles.count))
             let bytes = try await fetch(file.path, revision: baseRevision)
             guard matches(bytes, treeFile: file) else {
                 throw KokoroAneError.downloadFailed("Checksum mismatch: \(file.path)")

@@ -155,15 +155,20 @@ public enum KokoroAneResourceDownloader {
                     + "\(KokoroAneConstants.g2pRemoteRepo)/\(KokoroAneConstants.japaneseG2PRemoteSubdir)/...")
             let remoteURL = try ModelRegistry.resolveModel(
                 KokoroAneConstants.g2pRemoteRepo, "\(KokoroAneConstants.japaneseG2PRemoteSubdir)/\(name)")
-            _ = try await AssetDownloader.ensure(
-                .init(
-                    description: "Japanese G2P asset \(name)",
-                    remoteURL: remoteURL,
-                    destinationURL: localURL,
-                    transferMode: .file()
-                ),
-                logger: logger
-            )
+            // The dictionary files are large (matrix.bin is ~70 MB): use the retrying, byte-range
+            // resuming downloader so a dropped connection continues instead of failing the load.
+            let downloaded = try await FileDownloader.download(
+                request: HFClient.authorizedRequest(url: remoteURL),
+                path: "\(KokoroAneConstants.japaneseG2PRemoteSubdir)/\(name)",
+                expectedSize: 0,
+                partialFileURL: localURL.appendingPathExtension("partial"),
+                onProgress: nil,
+                maxAttempts: 6)
+            if FileManager.default.fileExists(atPath: localURL.path) {
+                try? FileManager.default.removeItem(at: localURL)
+            }
+            try FileManager.default.moveItem(at: downloaded, to: localURL)
+            try JapaneseMecabDictionary.validateAsset(named: name, at: localURL)
         }
         return g2pDir
     }

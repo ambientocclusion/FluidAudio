@@ -323,6 +323,12 @@ public actor KokoroAneModelStore {
         return v
     }
 
+    /// ANE-v3: open the fallback models (used beyond the static buckets) now instead of on first use.
+    /// No-op for the legacy runtime, which loads every stage up front.
+    public func loadFallbackModels(progress: KokoroAneLoadProgressHandler? = nil) throws {
+        try v3Pipeline?.loadFallbackModels(progress: progress)
+    }
+
     public func voicePack(_ voice: String) async throws -> KokoroAneVoicePack {
         if let cached = voicePacks[voice] { return cached }
         guard let repoDir = repoDirectory else {

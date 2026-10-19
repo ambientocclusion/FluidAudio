@@ -108,6 +108,18 @@ final class KokoroAneV3Pipeline {
             })
     }
 
+    /// Opens the deferred fallback models now, for apps that prefer a longer load to a pause on the
+    /// first request that exceeds the static buckets.
+    func loadFallbackModels(progress: KokoroAneLoadProgressHandler? = nil) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        let keys = deferredModels.keys.sorted()
+        for (index, key) in keys.enumerated() {
+            progress?(.loadingModel(name: "Kokoro" + key, index: index + 1, count: keys.count))
+            _ = try model(key)
+        }
+    }
+
     /// A loaded model, opening a deferred one on first use. Called with `lock` held.
     private func model(_ key: String) throws -> MLModel {
         if let model = models[key] { return model }

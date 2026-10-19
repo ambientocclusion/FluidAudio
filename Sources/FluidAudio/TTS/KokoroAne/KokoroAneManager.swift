@@ -269,6 +269,12 @@ public actor KokoroAneManager {
         englishFrontendReady = true
     }
 
+    /// ANE-v3 defers its fallback models (long inputs beyond the static buckets) to first use; call
+    /// this after `initialize` to load them up front instead.
+    public func loadFallbackModels(progress: KokoroAneLoadProgressHandler? = nil) async throws {
+        try await store.loadFallbackModels(progress: progress)
+    }
+
     /// Drop loaded mlmodelcs + voice packs. The store reloads on next call.
     public func cleanup() async {
         await store.cleanup()
